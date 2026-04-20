@@ -187,7 +187,7 @@ export interface Operation {
 
 const get_page: Operation = {
   name: 'get_page',
-  description: 'Read a page by slug (supports optional fuzzy matching)',
+  description: "Read a single page from the user's persistent knowledge base (eBrain) by its slug. Use this after a `query` or `search` returns a slug you want the full contents of. Pages include research notes, project plans, decision records, transcripts, and wiki content the user has written or ingested over time.",
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
@@ -221,7 +221,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link is enabled) extracts + reconciles graph links.',
+  description: "Write or update a page in the user's persistent knowledge base (eBrain). Use when the user asks you to save research, notes, a decision record, or a wiki page, OR when you've done substantial research worth preserving. Content is chunked, embedded (OpenAI text-embedding-3-large), tagged, and graph-linked automatically.",
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -336,7 +336,7 @@ async function runAutoLink(
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Delete a page',
+  description: "Delete a page from the user's eBrain. Use when the user explicitly asks to remove a page, or when you've created a duplicate/stale page that should be retired.",
   params: {
     slug: { type: 'string', required: true },
   },
@@ -351,7 +351,7 @@ const delete_page: Operation = {
 
 const list_pages: Operation = {
   name: 'list_pages',
-  description: 'List pages with optional filters',
+  description: "Browse the user's eBrain pages with optional filters (by type: source/entity/concept/comparison/synthesis, or by tag). Use when you need a paginated catalog rather than a specific answer. For most questions `query` is the right tool instead.",
   params: {
     type: { type: 'string', description: 'Filter by page type' },
     tag: { type: 'string', description: 'Filter by tag' },
@@ -377,7 +377,7 @@ const list_pages: Operation = {
 
 const search: Operation = {
   name: 'search',
-  description: 'Keyword search using full-text search',
+  description: "Exact keyword search over the user's eBrain using Postgres full-text search (tsvector). Use when the query contains a unique proper noun, slug fragment, command name, or verbatim phrase you expect to match exactly. Faster and more precise than `query` for these cases. For fuzzy/semantic questions, use `query` instead.",
   params: {
     query: { type: 'string', required: true },
     limit: { type: 'number', description: 'Max results (default 20)' },
@@ -395,7 +395,7 @@ const search: Operation = {
 
 const query: Operation = {
   name: 'query',
-  description: 'Hybrid search with vector + keyword + multi-query expansion',
+  description: "PRIMARY KNOWLEDGE LOOKUP TOOL. Hybrid semantic + keyword search over the user's eBrain (~1000 pages: research notes, project plans, decision records, ingested transcripts, wiki pages). Use this WHENEVER the user asks about their past work, decisions, opinions, projects, or prior reasoning — phrases like 'have I', 'did I', 'what did I write about', 'what's my take on', 'do I already have', 'remind me about', 'what do I know about X', or any question that touches the user's personal projects (Clinora, Pulsar, Intel, Learnity, media-mcp, ebrain, etc.). Also use BEFORE writing any new research/planning/wiki content to check for existing coverage and avoid duplicates. Uses vector embeddings (OpenAI text-embedding-3-large) + tsvector keyword + RRF fusion + optional multi-query expansion.",
   params: {
     query: { type: 'string', required: true },
     limit: { type: 'number', description: 'Max results (default 20)' },
@@ -504,7 +504,7 @@ const remove_link: Operation = {
 
 const get_links: Operation = {
   name: 'get_links',
-  description: 'List outgoing links from a page',
+  description: "List outgoing links from a page (the pages THIS page references). Use to follow connections in the user's eBrain knowledge graph.",
   params: {
     slug: { type: 'string', required: true },
   },
@@ -515,7 +515,7 @@ const get_links: Operation = {
 
 const get_backlinks: Operation = {
   name: 'get_backlinks',
-  description: 'List incoming links to a page',
+  description: "List incoming links to a page (pages that REFERENCE this one). Use when you need 'what else talks about X' in the user's eBrain.",
   params: {
     slug: { type: 'string', required: true },
   },
@@ -537,7 +537,7 @@ const TRAVERSE_DEPTH_CAP = 10;
 
 const traverse_graph: Operation = {
   name: 'traverse_graph',
-  description: 'Traverse link graph from a page. With link_type/direction, returns edges (GraphPath[]) instead of nodes.',
+  description: "Traverse the user's eBrain knowledge graph from a starting page — N hops out. Use for 'what's connected to X' or relational questions ('what depends on our ebrain architecture'). With link_type/direction, returns typed edges instead of just nodes.",
   params: {
     slug: { type: 'string', required: true },
     depth: { type: 'number', description: `Max traversal depth (default 5, capped at ${TRAVERSE_DEPTH_CAP})` },
@@ -621,7 +621,7 @@ const get_timeline: Operation = {
 
 const get_stats: Operation = {
   name: 'get_stats',
-  description: 'Brain statistics (page count, chunk count, etc.)',
+  description: "eBrain statistics — total page count, chunk count, embedding coverage, recent activity. Use when the user asks 'how big is my brain' or you need to sanity-check state before bulk operations.",
   params: {},
   handler: async (ctx) => {
     return ctx.engine.getStats();
@@ -728,7 +728,7 @@ const get_raw_data: Operation = {
 
 const resolve_slugs: Operation = {
   name: 'resolve_slugs',
-  description: 'Fuzzy-resolve a partial slug to matching page slugs',
+  description: "Fuzzy-resolve a partial slug to matching eBrain page slugs. Use when you have a vague reference like 'the schluntz page' and need to find the exact slug before calling get_page.",
   params: {
     partial: { type: 'string', required: true },
   },
