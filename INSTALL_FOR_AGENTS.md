@@ -3,6 +3,17 @@
 Read this entire file, then follow the steps. Ask the user for API keys when needed.
 Target: ~30 minutes to a fully working brain.
 
+## Step 0: If you are not Claude Code
+
+Read `AGENTS.md` at the repo root first. It's the non-Claude-agent operating
+protocol (install, read order, trust boundary, common tasks). Claude Code reads
+`CLAUDE.md` automatically and can skip ahead.
+
+If you fetched this file by URL without cloning yet, the companion files live at:
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md` — start here
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/llms.txt` — full doc map
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/llms-full.txt` — same map, inlined
+
 ## Step 1: Install GBrain
 
 ```bash
@@ -14,6 +25,11 @@ bun install && bun link
 
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
 restart the shell or add the PATH export to the shell profile.
+
+> **Do NOT use `bun install -g github:garrytan/gbrain`.** Bun blocks the top-level
+> postinstall hook on global installs, so schema migrations never run and the CLI
+> aborts with `Aborted()` when it opens PGLite. Use the `git clone + bun link` path
+> above. Tracking issue: [#218](https://github.com/garrytan/gbrain/issues/218).
 
 ## Step 2: API Keys
 
@@ -44,6 +60,63 @@ mkdir -p ~/brain && cd ~/brain && git init
 Read `~/gbrain/docs/GBRAIN_RECOMMENDED_SCHEMA.md` and set up the MECE directory
 structure (people/, companies/, concepts/, etc.) inside the user's brain repo,
 NOT inside ~/gbrain.
+
+## Step 3.5: Confirm search mode with the user (DO NOT SKIP)
+
+`gbrain init` auto-applied a default search mode (`tokenmax` unless your subagent
+tier is Haiku-class or no OpenAI key is configured). The init output included the
+cost matrix below preceded by `[AGENT]` markers. You must NOT silently accept the
+default. Stop and ask the operator.
+
+**Present this matrix verbatim:**
+
+```
+Per-query cost @ 10K queries/mo (typical single-user volume):
+
+                  Haiku 4.5     Sonnet 4.6    Opus 4.7
+                  ($1/M)        ($3/M)        ($5/M)
+  conservative    $40/mo        $120/mo       $200/mo
+  balanced        $100/mo       $300/mo       $500/mo
+  tokenmax        $200/mo       $600/mo       $1,000/mo
+
+(scales linearly: ×10 for 100K/mo, ÷10 for 1K. 25x corner-to-corner spread.
+ Natural diagonal pairings — cheap/cheap → frontier/frontier — span ~4x.)
+```
+
+**Ask the operator (paraphrase if needed):**
+
+> Your gbrain just installed with search mode `<auto-applied default>`. This is
+> a one-time setup decision that controls retrieval payload size. Which mode
+> do you want?
+>
+>   1) conservative — tight 4K budget, no LLM expansion, 10 chunks max.
+>      Best for Haiku subagents, cost-sensitive setups, high-volume loops.
+>
+>   2) balanced — 12K budget, no expansion, 25 chunks. Sonnet-tier sweet spot.
+>
+>   3) tokenmax (recommended default — preserves v0.31.x retrieval shape) —
+>      no budget, LLM expansion ON, 50 chunks. Best for Opus/frontier models.
+>
+> Cost depends on BOTH the mode AND the downstream model you run. See the
+> matrix above for the 9-cell breakdown.
+
+If the operator picks a non-default mode, run:
+```bash
+gbrain config set search.mode <mode>
+```
+
+If they pick tokenmax AND want to preserve the literal v0.31.x default
+(limit=20 instead of tokenmax's 50), also run:
+```bash
+gbrain config set search.searchLimit 20
+```
+
+Verify the choice with `gbrain search modes` before continuing.
+
+**Why this matters:** the cost spread between corners of the matrix is 25x.
+An agent that silently accepts the default and starts running queries against
+a user who didn't expect tokenmax-class context loads can rack up surprise
+spend. Confirm before continuing.
 
 ## Step 4: Import and Index
 
@@ -113,8 +186,9 @@ Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab):
 - **Live sync** (every 15 min): `gbrain sync --repo ~/brain && gbrain embed --stale`
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install)
 - **Dream cycle** (nightly): read `docs/guides/cron-schedule.md` for the full protocol.
-  Entity sweep, citation fixes, memory consolidation. This is what makes the brain
-  compound. Do not skip it.
+  Entity sweep, citation fixes, memory consolidation, plus (v0.23+) overnight conversation
+  synthesis and cross-session pattern detection. 8 phases, one cron-friendly command. This
+  is what makes the brain compound. Do not skip it.
 - **Weekly**: `gbrain doctor --json && gbrain embed --stale`
 
 ## Step 8: Integrations
@@ -127,13 +201,13 @@ Verify: `gbrain integrations doctor` (after at least one is configured)
 
 ## Step 9: Verify
 
-Read `docs/GBRAIN_VERIFY.md` and run all 6 verification checks. Check #4 (live sync
+Read `docs/GBRAIN_VERIFY.md` and run all 7 verification checks. Check #4 (live sync
 actually works) is the most important.
 
 ## Upgrade
 
 ```bash
-cd ~/gbrain && git pull origin main && bun install
+cd ~/gbrain && git pull origin master && bun install
 gbrain init                           # apply schema migrations (idempotent)
 gbrain post-upgrade                   # show migration notes for the version range
 ```
@@ -142,6 +216,22 @@ Then read `~/gbrain/skills/migrations/v<NEW_VERSION>.md` (and any intermediate
 versions you skipped) and run any backfill or verification steps it lists. Skipping
 this is how features ship in the binary but stay dormant in the user's brain.
 
+**v0.32.3 search modes (one-time upgrade prompt):** if the user's brain was
+created before v0.32.3, `gbrain post-upgrade` prints a banner including the
+9-cell cost matrix (mode × downstream model) preceded by `[AGENT]` markers.
+**Do NOT silently move past the banner.** Present the matrix to the operator
+verbatim, ask which mode they want (recommended default: `tokenmax` to preserve
+v0.31.x retrieval shape), then run `gbrain config set search.mode <mode>`. See
+Step 3.5 above for the full ask-the-user protocol — the upgrade path uses the
+same matrix and same default.
+
 For v0.12.0+ specifically: if your brain was created before v0.12.0, run
 `gbrain extract links --source db && gbrain extract timeline --source db` to
 backfill the new graph layer (see Step 4.5 above).
+
+For v0.12.2+ specifically: if your brain is Postgres- or Supabase-backed and
+predates v0.12.2, the `v0_12_2` migration runs `gbrain repair-jsonb`
+automatically during `gbrain post-upgrade` to fix the double-encoded JSONB
+columns. PGLite brains no-op. If wiki-style imports were truncated by the old
+`splitBody` bug, run `gbrain sync --full` after upgrading to rebuild
+`compiled_truth` from source markdown.

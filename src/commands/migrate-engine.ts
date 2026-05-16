@@ -8,12 +8,12 @@
  */
 
 import { createEngine } from '../core/engine-factory.ts';
-import { loadConfig, saveConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
+import { loadConfig, saveConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { EngineConfig } from '../core/types.ts';
-import { homedir } from 'os';
-import { join } from 'path';
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'fs';
+import { createProgress } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 interface MigrateOpts {
   targetEngine: 'postgres' | 'pglite';
@@ -46,7 +46,7 @@ function parseArgs(args: string[]): MigrateOpts {
 }
 
 function getManifestPath(): string {
-  return join(homedir(), '.gbrain', 'migrate-manifest.json');
+  return gbrainPath('migrate-manifest.json');
 }
 
 interface MigrateManifest {
@@ -97,7 +97,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
       process.exit(1);
     }
   } else {
-    targetConfig.database_path = opts.targetPath || join(homedir(), '.gbrain', 'brain.pglite');
+    targetConfig.database_path = opts.targetPath || gbrainPath('brain.pglite');
   }
 
   // Connect to target
@@ -117,11 +117,13 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
 
   if (targetStats.page_count > 0 && opts.force) {
     console.log('--force: wiping target brain...');
-    // Delete all pages (cascades to chunks, links, tags, etc.)
-    const pages = await targetEngine.listPages({ limit: 100000 });
-    for (const p of pages) {
-      await targetEngine.deletePage(p.slug);
-    }
+    // v0.18.0+ multi-source: deletePage(slug) is now source-scoped (defaults
+    // to 'default'), so per-page iteration would skip non-default-source
+    // rows. migrate-engine --force is a destructive wipe across the entire
+    // brain — all sources, all pages — so we issue a raw DELETE that matches
+    // the original semantic. Cascades through content_chunks / page_links /
+    // tags / timeline_entries / page_versions via existing FKs.
+    await targetEngine.executeRaw('DELETE FROM pages');
   }
 
   // Load or create manifest for resume
@@ -130,7 +132,13 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     console.log('Previous migration was to a different target. Starting fresh.');
     manifest = null;
   }
+  // v0.32.8 F8: manifest keys are now `${source_id}::${slug}` so multi-source
+  // migrations don't collide on same-slug-different-source pages. Pre-v0.32.8
+  // entries were bare slugs; we keep treating those as default-source for
+  // back-compat resume.
   const completedSet = new Set(manifest?.completed_slugs || []);
+  const makeManifestKey = (sourceId: string, slug: string): string =>
+    sourceId === 'default' ? slug : `${sourceId}::${slug}`;
   if (!manifest) {
     manifest = {
       completed_slugs: [],
@@ -142,13 +150,23 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   // Get all source pages
   const sourceStats = await sourceEngine.getStats();
   const allPages = await sourceEngine.listPages({ limit: 100000 });
-  const pagesToMigrate = allPages.filter(p => !completedSet.has(p.slug));
+  const pagesToMigrate = allPages.filter(p => !completedSet.has(makeManifestKey(p.source_id, p.slug)));
 
   console.log(`Migrating ${pagesToMigrate.length} pages (${allPages.length} total, ${completedSet.size} already done)...`);
 
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  progress.start('migrate.copy_pages', pagesToMigrate.length);
+
   let migrated = 0;
   for (const page of pagesToMigrate) {
-    // Copy page
+    // v0.32.8 F8: thread source_id end-to-end so multi-source pages migrate
+    // intact. Pre-fix: putPage / getTags / getTimeline / getRawData / getLinks
+    // all silently defaulted to source_id='default', so non-default-source
+    // tags / timeline / raw / links were either dropped or attached to the
+    // wrong row.
+    const sourceOpts = { sourceId: page.source_id };
+
+    // Copy page (preserve source_id)
     await targetEngine.putPage(page.slug, {
       type: page.type,
       title: page.title,
@@ -156,10 +174,10 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
       timeline: page.timeline,
       frontmatter: page.frontmatter,
       content_hash: page.content_hash,
-    });
+    }, sourceOpts);
 
-    // Copy chunks with embeddings
-    const chunks = await sourceEngine.getChunksWithEmbeddings(page.slug);
+    // Copy chunks with embeddings.
+    const chunks = await sourceEngine.getChunksWithEmbeddings(page.slug, sourceOpts);
     if (chunks.length > 0) {
       await targetEngine.upsertChunks(page.slug, chunks.map(c => ({
         chunk_index: c.chunk_index,
@@ -168,55 +186,63 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
         embedding: c.embedding || undefined,
         model: c.model,
         token_count: c.token_count || undefined,
-      })));
+      })), sourceOpts);
     }
 
     // Copy tags
-    const tags = await sourceEngine.getTags(page.slug);
+    const tags = await sourceEngine.getTags(page.slug, sourceOpts);
     for (const tag of tags) {
-      await targetEngine.addTag(page.slug, tag);
+      await targetEngine.addTag(page.slug, tag, sourceOpts);
     }
 
     // Copy timeline
-    const timeline = await sourceEngine.getTimeline(page.slug);
+    const timeline = await sourceEngine.getTimeline(page.slug, sourceOpts);
     for (const entry of timeline) {
       await targetEngine.addTimelineEntry(page.slug, {
         date: entry.date,
         source: entry.source,
         summary: entry.summary,
         detail: entry.detail,
-      });
+      }, sourceOpts);
     }
 
     // Copy raw data
-    const rawData = await sourceEngine.getRawData(page.slug);
+    const rawData = await sourceEngine.getRawData(page.slug, undefined, sourceOpts);
     for (const rd of rawData) {
-      await targetEngine.putRawData(page.slug, rd.source, rd.data);
+      await targetEngine.putRawData(page.slug, rd.source, rd.data, sourceOpts);
     }
 
     // Copy versions
-    const versions = await sourceEngine.getVersions(page.slug);
+    const versions = await sourceEngine.getVersions(page.slug, sourceOpts);
     // Versions are snapshots, we recreate them on the target
     // (createVersion takes a snapshot of current state, which we just set)
 
-    // Track progress
-    manifest!.completed_slugs.push(page.slug);
+    // Track progress with composite key so multi-source resume is correct.
+    manifest!.completed_slugs.push(makeManifestKey(page.source_id, page.slug));
     saveManifest(manifest!);
     migrated++;
-
-    if (migrated % 50 === 0 || migrated === pagesToMigrate.length) {
-      console.log(`  Progress: ${migrated}/${pagesToMigrate.length} pages`);
-    }
+    progress.tick(1, page.slug);
   }
+  progress.finish();
 
-  // Copy links (after all pages exist in target)
+  // Copy links (after all pages exist in target).
+  // v0.32.8 F8: thread source_id so cross-source links migrate correctly.
   console.log('Copying links...');
+  progress.start('migrate.copy_links', allPages.length);
   for (const page of allPages) {
-    const links = await sourceEngine.getLinks(page.slug);
+    const sourceOpts = { sourceId: page.source_id };
+    const links = await sourceEngine.getLinks(page.slug, sourceOpts);
     for (const link of links) {
-      await targetEngine.addLink(link.from_slug, link.to_slug, link.context, link.link_type);
+      await targetEngine.addLink(
+        link.from_slug, link.to_slug,
+        link.context, link.link_type,
+        undefined, undefined, undefined,
+        { fromSourceId: page.source_id, toSourceId: page.source_id },
+      );
     }
+    progress.tick(1);
   }
+  progress.finish();
 
   // Copy config (selective)
   const configKeys = ['embedding_model', 'embedding_dimensions', 'chunk_strategy'];
@@ -236,11 +262,64 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
 
   // Clean up
   clearManifest();
-  await targetEngine.disconnect();
 
   console.log(`\nMigration complete. ${migrated} pages transferred.`);
   console.log(`Config updated to engine: ${opts.targetEngine}`);
   if (config.engine === 'pglite' && config.database_path) {
     console.log(`Original PGLite brain preserved at ${config.database_path} (backup).`);
   }
+
+  // Post-migrate verification: confirm the target is healthy before we
+  // leave the user. Catches incomplete copies, schema drift, and missing
+  // embeddings immediately instead of on next CLI use. Non-fatal — prints
+  // warnings and keeps going so the user sees the full picture.
+  console.log('\nVerifying target...');
+  try {
+    await verifyTarget(targetEngine, sourceStats.page_count);
+  } catch (e) {
+    console.warn(`  Verification could not complete: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  await targetEngine.disconnect();
+}
+
+/**
+ * Lightweight doctor-style verify run against the migrated target.
+ * Prints a small table of signals; does not exit. Callers own engine
+ * lifecycle.
+ */
+async function verifyTarget(engine: BrainEngine, expectedPages: number): Promise<void> {
+  const stats = await engine.getStats();
+  if (stats.page_count === expectedPages) {
+    console.log(`  ok  pages: ${stats.page_count} (matches source)`);
+  } else {
+    console.warn(`  WARN pages: ${stats.page_count} (source had ${expectedPages})`);
+  }
+
+  try {
+    const health = await engine.getHealth();
+    const pct = (health.embed_coverage * 100).toFixed(0);
+    if (health.embed_coverage >= 0.9) {
+      console.log(`  ok  embeddings: ${pct}% coverage, ${health.missing_embeddings} missing`);
+    } else {
+      console.warn(`  WARN embeddings: ${pct}% coverage, ${health.missing_embeddings} missing. Run: gbrain embed --stale`);
+    }
+  } catch (e) {
+    console.warn(`  WARN embeddings: could not measure (${e instanceof Error ? e.message : String(e)})`);
+  }
+
+  try {
+    const version = await engine.getConfig('version');
+    const { LATEST_VERSION } = await import('../core/migrate.ts');
+    const schemaVersion = parseInt(version || '0', 10);
+    if (schemaVersion >= LATEST_VERSION) {
+      console.log(`  ok  schema: version ${schemaVersion}`);
+    } else {
+      console.warn(`  WARN schema: version ${schemaVersion} (latest: ${LATEST_VERSION}). Run: gbrain apply-migrations --yes`);
+    }
+  } catch {
+    console.warn('  WARN schema: version could not be read');
+  }
+
+  console.log('  Full health check: gbrain doctor');
 }

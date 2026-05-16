@@ -36,6 +36,7 @@ const DATABASE_URL = process.env.DATABASE_URL ?? '';
 
 let tmp: string;
 let origHome: string | undefined;
+let origGbrainHome: string | undefined;
 let origPath: string | undefined;
 let fakeBinDir: string;
 const CLI_PATH = join(import.meta.dir, '..', '..', 'src', 'cli.ts');
@@ -61,7 +62,12 @@ if (!SKIP) {
 
 function freshTempHome(label: string) {
   const dir = mkdtempSync(join(tmpdir(), `gbrain-e2e-migration-${label}-`));
+  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
+  // is unset. Test fixtures write to `$dir/.gbrain/...`, so set HOME only
+  // and clear any inherited GBRAIN_HOME (which would route prefs to $dir
+  // directly, no .gbrain suffix).
   process.env.HOME = dir;
+  delete process.env.GBRAIN_HOME;
   // Seed config so Phase A's `gbrain init --migrate-only` has a target.
   mkdirSync(join(dir, '.gbrain'), { recursive: true });
   writeFileSync(
@@ -78,12 +84,15 @@ beforeAll(() => {
     return;
   }
   origHome = process.env.HOME;
+  origGbrainHome = process.env.GBRAIN_HOME;
 });
 
 afterAll(() => {
   if (SKIP) return;
   if (origHome === undefined) delete process.env.HOME;
   else process.env.HOME = origHome;
+  if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = origGbrainHome;
   if (origPath === undefined) delete process.env.PATH;
   else process.env.PATH = origPath;
   try { if (fakeBinDir) rmSync(fakeBinDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -121,13 +130,14 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
     expect(prefs.set_at).toBeTruthy();
     expect(prefs.set_in_version).toBeTruthy();
 
-    // Phase G: completed.jsonl has one entry for v0.11.0.
+    // Bug 3 (v0.14.2) — orchestrator no longer writes completed.jsonl.
+    // The runner (apply-migrations.ts) persists the result after the
+    // orchestrator returns. A direct orchestrator call in E2E leaves the
+    // ledger empty; the runner path is tested separately in
+    // test/apply-migrations.test.ts + test/migration-resume.test.ts.
     const completed = loadCompletedMigrations();
-    expect(completed.length).toBeGreaterThanOrEqual(1);
     const v0110Entries = completed.filter(e => e.version === '0.11.0');
-    expect(v0110Entries.length).toBe(1);
-    expect(['complete', 'partial']).toContain(v0110Entries[0].status!);
-    expect(v0110Entries[0].mode).toBe('pain_triggered');
+    expect(v0110Entries.length).toBe(0);
 
     // Phase F is skipped per COMMON_OPTS — autopilot should NOT have been
     // installed on this host.
@@ -142,15 +152,13 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
     const second = await v0_11_0.orchestrator(COMMON_OPTS);
     expect(['complete', 'partial']).toContain(second.status);
 
-    // completed.jsonl accumulates entries per run (each run appends one).
-    // The runtime semantics for resume are governed by the diff rule in
-    // apply-migrations; here we just assert the orchestrator itself doesn't
-    // blow up or produce different results on a second run.
-    const completed = loadCompletedMigrations();
-    const v0110 = completed.filter(e => e.version === '0.11.0');
-    expect(v0110.length).toBeGreaterThanOrEqual(2);
-    // Preferences should be stable (same mode, unchanged content).
+    // Bug 3 (v0.14.2) — orchestrator does not write completed.jsonl, so
+    // repeated direct invocations don't accumulate ledger entries. Assert
+    // the preferences state stays stable (the real idempotency signal for
+    // this orchestrator is "running again doesn't corrupt preferences").
     expect(loadPreferences().minion_mode).toBe('pain_triggered');
+    const completed = loadCompletedMigrations();
+    expect(completed.filter(e => e.version === '0.11.0').length).toBe(0);
   }, 90_000);
 
   test('host rewrite: builtin handlers auto-rewritten, non-builtins queued as JSONL TODOs', async () => {
@@ -233,15 +241,16 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
 
     // Orchestrator re-running on a partial → should succeed (schema apply
     // and smoke are idempotent; prefs are preserved from the partial
-    // record; host-rewrite runs its safe-skip pass; completed appends a
-    // new status:"complete" row).
+    // record; host-rewrite runs its safe-skip pass). Per Bug 3 (v0.14.2),
+    // the orchestrator itself doesn't append to completed.jsonl — the
+    // runner does. The stopgap's partial entry stays unchanged here.
     const result = await v0_11_0.orchestrator(COMMON_OPTS);
     expect(['complete', 'partial']).toContain(result.status);
 
     const completed = loadCompletedMigrations();
     const v0110 = completed.filter(e => e.version === '0.11.0');
-    // 1 partial (stopgap) + 1 post-orchestrator entry.
-    expect(v0110.length).toBe(2);
+    // Just the stopgap partial — orchestrator doesn't add its own entry.
+    expect(v0110.length).toBe(1);
     expect(v0110[0].status).toBe('partial');
     expect(v0110[0].source).toBe('fix-v0.11.0.sh');
   }, 90_000);

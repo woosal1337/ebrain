@@ -14,8 +14,11 @@
 
 import { VERSION } from '../version.ts';
 import { loadConfig } from '../core/config.ts';
-import { loadCompletedMigrations, type CompletedMigrationEntry } from '../core/preferences.ts';
+import { loadCompletedMigrations, appendCompletedMigration, type CompletedMigrationEntry } from '../core/preferences.ts';
 import { migrations, compareVersions, type Migration, type OrchestratorOpts } from './migrations/index.ts';
+
+/** Bug 3 — max consecutive partials before we wedge a migration. */
+const MAX_CONSECUTIVE_PARTIALS = 3;
 
 interface ApplyMigrationsArgs {
   list: boolean;
@@ -26,6 +29,19 @@ interface ApplyMigrationsArgs {
   specificMigration?: string;
   hostDir?: string;
   noAutopilotInstall: boolean;
+  /** Bug 3 — explicit reset for a wedged migration. Writes a 'retry' marker. */
+  forceRetry?: string;
+  /**
+   * v0.30.1 namespaced --force flags (codex T5):
+   *   --force-orchestrator: write 'retry' markers for ALL wedged orchestrator migrations
+   *   --force-schema:       reset schema-version drift (re-run runMigrations)
+   *   --force-all:          both
+   */
+  forceOrchestrator?: boolean;
+  forceSchema?: boolean;
+  forceAll?: boolean;
+  /** v0.30.1 (D6 / X3): bypass verify-hook drift detection on a single run. */
+  skipVerify?: boolean;
   help: boolean;
 }
 
@@ -49,6 +65,11 @@ function parseArgs(args: string[]): ApplyMigrationsArgs {
     specificMigration: val('--migration'),
     hostDir: val('--host-dir'),
     noAutopilotInstall: has('--no-autopilot-install'),
+    forceRetry: val('--force-retry'),
+    forceOrchestrator: has('--force-orchestrator'),
+    forceSchema: has('--force-schema'),
+    forceAll: has('--force-all') || has('--force'),
+    skipVerify: has('--skip-verify'),
     help: has('--help') || has('-h'),
   };
 }
@@ -63,6 +84,20 @@ Usage:
   gbrain apply-migrations --list         Show applied + pending migrations.
   gbrain apply-migrations --migration vX.Y.Z
                                          Force-run a specific migration by version.
+  gbrain apply-migrations --force-retry vX.Y.Z
+                                         Clear a wedged migration (3+ consecutive
+                                         partials). Writes a 'retry' marker so the
+                                         next run treats it as fresh.
+  gbrain apply-migrations --force-orchestrator
+                                         Reset every wedged orchestrator migration
+                                         in one shot (writes 'retry' for each).
+  gbrain apply-migrations --force-schema
+                                         Reset schema-version drift; re-runs
+                                         runMigrations from current config.version.
+  gbrain apply-migrations --force        (alias --force-all) Apply both
+                                         --force-orchestrator and --force-schema.
+  gbrain apply-migrations --skip-verify  Bypass post-condition verify hooks on
+                                         non-idempotent migrations (D6 escape hatch).
 
 Flags:
   --mode <always|pain_triggered|off>     Set minion_mode without prompting.
@@ -94,14 +129,38 @@ function indexCompleted(entries: CompletedMigrationEntry[]): CompletedIndex {
     : { byVersion: new Map() };
 }
 
-/** Returns the resolved status for a migration based on its entries. */
+/**
+ * Returns the resolved status for a migration based on its entries.
+ *
+ * Semantics (Bug 3 — keep "complete wins" safety):
+ *   - If any entry is `complete`, the version is complete. Terminal state.
+ *   - Otherwise, if the latest entry is `retry`, the version is pending
+ *     (user requested a fresh attempt).
+ *   - Otherwise, if any entry is `partial`, the version is partial.
+ *   - Otherwise, pending.
+ *
+ * `complete` never regresses. A later accidental `partial` append cannot
+ * undo a completed migration.
+ */
 function statusForVersion(
   version: string,
   idx: CompletedIndex,
-): 'complete' | 'partial' | 'pending' {
+): 'complete' | 'partial' | 'pending' | 'wedged' {
   const entries = idx.byVersion.get(version) ?? [];
   if (entries.length === 0) return 'pending';
   if (entries.some(e => e.status === 'complete')) return 'complete';
+  const latest = entries[entries.length - 1];
+  if (latest.status === 'retry') return 'pending';
+  // Bug 3 attempt cap — count consecutive partials from the end (stopping
+  // at any 'retry' or 'complete'). If we hit MAX_CONSECUTIVE_PARTIALS,
+  // the migration is wedged and needs explicit --force-retry to try again.
+  let consecutive = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.status === 'partial') consecutive++;
+    else break;
+  }
+  if (consecutive >= MAX_CONSECUTIVE_PARTIALS) return 'wedged';
   if (entries.some(e => e.status === 'partial')) return 'partial';
   return 'pending';
 }
@@ -111,6 +170,7 @@ interface Plan {
   partial: Migration[];
   pending: Migration[];
   skippedFuture: Migration[];
+  wedged: Migration[];
 }
 
 /**
@@ -127,7 +187,7 @@ interface Plan {
  * skip v0.11.0 when running v0.11.1. Compare against completed.jsonl.
  */
 function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: string): Plan {
-  const plan: Plan = { applied: [], partial: [], pending: [], skippedFuture: [] };
+  const plan: Plan = { applied: [], partial: [], pending: [], skippedFuture: [], wedged: [] };
   for (const m of migrations) {
     if (filterVersion && m.version !== filterVersion) continue;
     if (compareVersions(m.version, installed) > 0) {
@@ -137,6 +197,7 @@ function buildPlan(idx: CompletedIndex, installed: string, filterVersion?: strin
     const status = statusForVersion(m.version, idx);
     if (status === 'complete') plan.applied.push(m);
     else if (status === 'partial') plan.partial.push(m);
+    else if (status === 'wedged') plan.wedged.push(m);
     else plan.pending.push(m);
   }
   return plan;
@@ -149,6 +210,7 @@ function printList(plan: Plan, installed: string): void {
   const rows: Array<{ status: string; m: Migration }> = [
     ...plan.applied.map(m => ({ status: 'applied', m })),
     ...plan.partial.map(m => ({ status: 'partial', m })),
+    ...plan.wedged.map(m => ({ status: 'wedged', m })),
     ...plan.pending.map(m => ({ status: 'pending', m })),
     ...plan.skippedFuture.map(m => ({ status: 'future', m })),
   ];
@@ -227,9 +289,115 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     return;
   }
 
+  // Bug 3 — --force-retry: write an explicit reset marker for a wedged
+  // migration, then return. User re-runs `gbrain apply-migrations --yes`
+  // to actually re-attempt.
+  if (cli.forceRetry) {
+    const target = migrations.find(m => m.version === cli.forceRetry);
+    if (!target) {
+      console.error(`No migration registered with version "${cli.forceRetry}". Run \`gbrain apply-migrations --list\`.`);
+      process.exit(2);
+    }
+    appendCompletedMigration({ version: cli.forceRetry, status: 'retry' });
+    console.log(`Wrote 'retry' marker for v${cli.forceRetry}. Run \`gbrain apply-migrations --yes\` to re-attempt.`);
+    return;
+  }
+
+  // v0.30.1 (codex T5): --force-orchestrator OR --force-all writes a 'retry'
+  // marker for EVERY wedged orchestrator migration in one shot. User re-runs
+  // `gbrain apply-migrations --yes` to actually re-attempt.
+  if (cli.forceOrchestrator || cli.forceAll) {
+    const completed = loadCompletedMigrations();
+    const idx = indexCompleted(completed);
+    let resetCount = 0;
+    for (const m of migrations) {
+      const status = statusForVersion(m.version, idx);
+      if (status === 'wedged') {
+        appendCompletedMigration({ version: m.version, status: 'retry' });
+        console.log(`Wrote 'retry' marker for v${m.version} (${m.featurePitch.headline.slice(0, 60)})`);
+        resetCount++;
+      }
+    }
+    if (resetCount === 0) {
+      console.log('No wedged orchestrator migrations found.');
+    } else {
+      console.log(`\nReset ${resetCount} wedged orchestrator migration(s). Run \`gbrain apply-migrations --yes\` to re-attempt.`);
+    }
+    if (!cli.forceAll) return; // --force-schema continues below if --force-all is set
+  }
+
+  // v0.30.1 (codex T5): --force-schema OR --force-all resets schema-version
+  // drift by re-running runMigrations(). When the actual DDL state diverges
+  // from config.version (the brain_config incident), this is the manual
+  // recovery path.
+  if (cli.forceSchema || cli.forceAll) {
+    try {
+      const { runMigrations } = await import('../core/migrate.ts');
+      const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
+      const { createEngine } = await import('../core/engine-factory.ts');
+      const cfg = lc();
+      if (!cfg) {
+        console.error('No brain configured for --force-schema.');
+        process.exit(2);
+      }
+      const eng = await createEngine(toEngineConfig(cfg));
+      await eng.connect(toEngineConfig(cfg));
+      console.log('Running schema migrations from current config.version...');
+      const result = await runMigrations(eng);
+      console.log(`Applied ${result.applied} schema migration(s); now at v${result.current}.`);
+      await eng.disconnect();
+    } catch (err) {
+      console.error(`--force-schema failed: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    if (cli.forceSchema && !cli.forceAll) return;
+    if (cli.forceAll) return; // both surfaces flushed
+  }
+
+  // Pre-flight: warn if schema migrations (migrate.ts) are behind.
+  // apply-migrations runs orchestrator migrations only; schema migrations
+  // run via connectEngine() / initSchema(). Users often expect this CLI
+  // to handle everything (Issue 1 from v0.18.0 field report).
+  try {
+    const { LATEST_VERSION } = await import('../core/migrate.ts');
+    const { loadConfig: lc, toEngineConfig } = await import('../core/config.ts');
+    const { createEngine } = await import('../core/engine-factory.ts');
+    const cfg = lc();
+    if (cfg) {
+      const eng = await createEngine(toEngineConfig(cfg));
+      await eng.connect(toEngineConfig(cfg));
+      const verStr = await eng.getConfig('version');
+      const schemaVer = parseInt(verStr || '1', 10);
+      await eng.disconnect();
+      if (schemaVer < LATEST_VERSION) {
+        console.warn(
+          `\n⚠️  Schema version ${schemaVer} is behind latest ${LATEST_VERSION}.\n` +
+          `   Schema migrations run automatically on next connectEngine() / initSchema().\n` +
+          `   To run them now: gbrain init --migrate-only\n`,
+        );
+      }
+    }
+  } catch {
+    // Non-fatal: if DB is unreachable, orchestrator migrations can still
+    // run their filesystem-only phases.
+  }
+
   const completed = loadCompletedMigrations();
   const idx = indexCompleted(completed);
   const plan = buildPlan(idx, installed, cli.specificMigration);
+
+  // Bug 3 — surface wedged migrations as a loud, actionable error.
+  if (plan.wedged.length > 0) {
+    for (const m of plan.wedged) {
+      console.error(
+        `\nMigration v${m.version} is WEDGED (${MAX_CONSECUTIVE_PARTIALS}+ consecutive partials with no completion). ` +
+        `Check ~/.gbrain/upgrade-errors.jsonl for the last failure reasons, fix the underlying issue, then run:\n` +
+        `  gbrain apply-migrations --force-retry ${m.version}\n` +
+        `Then re-run \`gbrain apply-migrations --yes\`.`,
+      );
+    }
+    // Don't exit — applied/partial/pending are still worth reporting and running.
+  }
 
   if (cli.specificMigration && plan.applied.length + plan.partial.length + plan.pending.length + plan.skippedFuture.length === 0) {
     console.error(`No migration registered with version "${cli.specificMigration}". Run \`gbrain apply-migrations --list\` to see registered versions.`);
@@ -248,6 +416,11 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
   // Run each orchestrator in registry order. An orchestrator failure aborts
   // the rest of the chain; fixing the failure and re-running picks up where
   // we left off (per-phase idempotency markers + resume from "partial").
+  //
+  // Bug 3 — the RUNNER owns the ledger write now. Orchestrators return their
+  // result; we persist it here with a canonical shape. If the write fails,
+  // surface the error and DO NOT proceed to the next migration (a silent
+  // ledger drop was the root cause of the original infinite-retry symptom).
   let failed = false;
   for (const m of toRun) {
     console.log(`\n=== Applying migration v${m.version}: ${m.featurePitch.headline} ===`);
@@ -255,9 +428,45 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
       const result = await m.orchestrator(orchestratorOptsFrom(cli));
       if (result.status === 'failed') {
         console.error(`Migration v${m.version} reported status=failed.`);
+        // Record the attempt as 'partial' (not 'complete') so the cap counts
+        // it. Don't let a failed orchestrator look like it never ran.
+        try {
+          appendCompletedMigration({
+            version: m.version,
+            status: 'partial',
+            phases: result.phases,
+            files_rewritten: result.files_rewritten,
+            autopilot_installed: result.autopilot_installed,
+            install_target: result.install_target,
+            apply_migrations_pending: result.pending_host_work ? result.pending_host_work > 0 : undefined,
+          });
+        } catch (e) {
+          console.error(`Also: could not persist failure record: ${e instanceof Error ? e.message : String(e)}`);
+        }
         failed = true;
         break;
       }
+
+      // Persist the terminal outcome. appendCompletedMigration no-ops when
+      // the last entry for this version is already 'complete' (idempotency
+      // guard), so repeated clean runs don't spam the ledger.
+      try {
+        appendCompletedMigration({
+          version: m.version,
+          status: result.status, // 'complete' | 'partial'
+          phases: result.phases,
+          files_rewritten: result.files_rewritten,
+          autopilot_installed: result.autopilot_installed,
+          install_target: result.install_target,
+          apply_migrations_pending: result.pending_host_work ? result.pending_host_work > 0 : undefined,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`Failed to persist ledger entry for v${m.version}: ${msg}. Stopping to prevent silent drift.`);
+        failed = true;
+        break;
+      }
+
       if (result.status === 'partial') {
         console.log(`Migration v${m.version} finished as PARTIAL. Re-run \`gbrain apply-migrations --yes\` after resolving any pending host-work items.`);
       } else {
@@ -266,6 +475,10 @@ export async function runApplyMigrations(args: string[]): Promise<void> {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`Migration v${m.version} threw: ${msg}`);
+      // Same partial-on-throw treatment so the cap counts runaway failures.
+      try {
+        appendCompletedMigration({ version: m.version, status: 'partial' });
+      } catch { /* swallow ledger-write failure on throw path */ }
       failed = true;
       break;
     }

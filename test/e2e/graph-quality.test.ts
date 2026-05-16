@@ -22,7 +22,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
-});
+}, 60_000);
 
 afterAll(async () => {
   await engine.disconnect();
@@ -40,11 +40,15 @@ function makeContext(): OperationContext {
     config: { engine: 'pglite' } as any,
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
+    // E2E graph quality simulates local-CLI writes (auto-link / timeline run).
+    // After F7b made `remote` required this needs to be explicit.
+    remote: false,
+    sourceId: 'default',
   };
 }
 
 describe('E2E graph quality (v0.10.1 pipeline)', () => {
-  beforeEach(truncateAll);
+  beforeEach(truncateAll, 15_000);
 
   test('full pipeline: seed -> link-extract -> timeline-extract -> verify', async () => {
     // Seed 5 pages with entity refs and timeline content.
@@ -163,6 +167,78 @@ Now I'm meeting with [Bob](people/bob).
     links = await engine.getLinks('notes/test');
     expect(links.length).toBe(1);
     expect(links[0].to_slug).toBe('people/bob');
+  });
+
+  test('auto-timeline: put_page extracts + inserts timeline entries', async () => {
+    const putOp = operationsByName['put_page'];
+    const result = await putOp.handler(makeContext(), {
+      slug: 'people/dana',
+      content: `---
+type: person
+title: Dana
+---
+
+Dana is a founder.
+
+## Timeline
+
+- **2026-03-15** | Shipped v1.0
+- **2026-04-02** | Closed seed round
+`,
+    });
+
+    expect((result as any).auto_timeline).toBeDefined();
+    expect((result as any).auto_timeline.created).toBe(2);
+
+    const entries = await engine.getTimeline('people/dana');
+    expect(entries.length).toBe(2);
+    const dates = entries.map((e: any) => {
+      const d = e.date instanceof Date ? e.date.toISOString().slice(0, 10) : String(e.date).slice(0, 10);
+      return d;
+    }).sort();
+    expect(dates).toEqual(['2026-03-15', '2026-04-02']);
+  });
+
+  test('auto-timeline is idempotent: re-write does not duplicate entries', async () => {
+    const putOp = operationsByName['put_page'];
+    const content = `---
+type: person
+title: Eve
+---
+
+## Timeline
+
+- **2026-03-15** | Shipped
+`;
+    await putOp.handler(makeContext(), { slug: 'people/eve', content });
+    await putOp.handler(makeContext(), { slug: 'people/eve', content });
+
+    const entries = await engine.getTimeline('people/eve');
+    expect(entries.length).toBe(1);
+  });
+
+  test('auto-timeline respects auto_timeline=false config', async () => {
+    await engine.setConfig('auto_timeline', 'false');
+    try {
+      const putOp = operationsByName['put_page'];
+      const result = await putOp.handler(makeContext(), {
+        slug: 'people/frank',
+        content: `---
+type: person
+title: Frank
+---
+
+## Timeline
+
+- **2026-03-15** | Something happened
+`,
+      });
+      expect((result as any).auto_timeline).toBeUndefined();
+      const entries = await engine.getTimeline('people/frank');
+      expect(entries.length).toBe(0);
+    } finally {
+      await engine.setConfig('auto_timeline', 'true');
+    }
   });
 
   test('auto-link respects auto_link=false config', async () => {

@@ -52,6 +52,7 @@ Running a production brain.
 | [Cron via Minions](../skills/conventions/cron-via-minions.md) | Why scheduled work runs as Minion jobs, not `agentTurn`. Auto-applied by v0.11.0 migration for built-in handlers; host-specific handlers use the plugin contract below. |
 | [Plugin Handlers](guides/plugin-handlers.md) | Registering host-specific Minion handlers via code (no data-file exec surface). |
 | [Minions fix](guides/minions-fix.md) | Repairing a half-migrated v0.11.0 install. |
+| [Shell jobs (v0.14.0+)](guides/minions-shell-jobs.md) | Move deterministic crons (API fetch, token refresh, scrape+write) off the LLM gateway. Zero tokens per fire, ~60% gateway headroom. Follow `skills/migrations/v0.14.0.md` for the adoption playbook. |
 | [Quiet Hours & Timezone](guides/quiet-hours.md) | Hold notifications during sleep, timezone-aware delivery |
 | [Executive Assistant Pattern](guides/executive-assistant.md) | Email triage, meeting prep, scheduling |
 | [Operational Disciplines](guides/operational-disciplines.md) | Signal detection, brain-first, sync-after-write, heartbeat, dream cycle |
@@ -100,6 +101,16 @@ Keeping it running and up to date.
 |-------|---------------|
 | [Upgrades & Auto-Update](guides/upgrades-auto-update.md) | check-update, agent notifications, migration files |
 | [Live Sync](guides/live-sync.md) | Keep the index current: cron, --watch, webhook approaches |
+
+## Getting Started
+
+After setup, the brain is empty. The cold-start skill sequences the highest-leverage
+data sources to populate it:
+
+| Guide | What It Covers |
+|-------|---------------|
+| [Cold Start](../skills/cold-start/SKILL.md) | Day-one bootstrapping: contacts, calendar, email, conversations, social, archives. Uses ClawVisor for safe credential handling — agents never hold raw API keys. |
+| [Ask User](../skills/ask-user/SKILL.md) | Choice-gate pattern for human input at decision points. Used by cold-start and other skills. |
 
 ---
 
